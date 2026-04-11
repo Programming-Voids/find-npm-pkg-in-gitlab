@@ -31,6 +31,7 @@ Environment variables:
 import argparse
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -242,10 +243,16 @@ def parse_args() -> argparse.Namespace:
 # and save progress when Ctrl+C is pressed during a scan
 _current_scan_state: Optional[ScanState] = None
 _state_file_path: Optional[str] = None
+_interrupt_event: threading.Event = threading.Event()
 
 
 def _handle_interrupt(signum: int, frame: Any) -> None:
-    """Handle Ctrl+C to save state before exiting."""
+    """Handle Ctrl+C to save state before exiting.
+    
+    Sets the interrupt event to signal the main scan loop to stop,
+    then performs graceful cleanup by saving state and exiting.
+    """
+    _interrupt_event.set()
     if _current_scan_state and _state_file_path:
         print("\n")
         log_terminal_line("[INTERRUPTED] Saving scan state before exit...", ANSI_YELLOW)
@@ -646,7 +653,16 @@ def _execute_scan(args: argparse.Namespace, projects: List[Dict[str, Any]], rule
         }
 
         # Process completed scans as they finish (order doesn't matter for results)
-        for future in as_completed(future_map):
+        # Use timeout=0.1 to wake up periodically and check for interrupts
+        for future in as_completed(future_map, timeout=0.1):
+            # Check if interrupt signal was received (Ctrl+C)
+            if _interrupt_event.is_set():
+                # Cancel all remaining futures
+                for f in future_map:
+                    f.cancel()
+                # Exit cleanly (signal handler will do final cleanup)
+                raise KeyboardInterrupt("Scan interrupted by user")
+            
             project = future_map[future]
             project_name = project.get("path_with_namespace", str(project.get("id")))
 
@@ -788,7 +804,10 @@ def main() -> int:
     8. Output results and save final state if needed
     """
     
-    global _current_scan_state, _state_file_path
+    global _current_scan_state, _state_file_path, _interrupt_event
+
+    # Reset interrupt event for new scan
+    _interrupt_event.clear()
 
     # Parse command-line arguments
     args = parse_args()
@@ -823,7 +842,16 @@ def main() -> int:
 
     # Execute the main parallel scanning loop
     # Returns list of projects with findings
-    results = _execute_scan(args, projects, rule, compiled_ranges, filenames, _current_scan_state, findings_manager)
+    # Wrapped in try-except to handle graceful Ctrl+C interruption
+    try:
+        results = _execute_scan(args, projects, rule, compiled_ranges, filenames, _current_scan_state, findings_manager)
+    except KeyboardInterrupt:
+        # User pressed Ctrl+C during scan
+        # Save state for resuming later
+        if _current_scan_state and args.state_file:
+            save_state(_current_scan_state, args.state_file)
+        log_terminal_line("[INTERRUPTED] Scan cancelled by user.", ANSI_YELLOW)
+        return 1
 
     # Output results and handle final state saving
     return _output_results(args, projects, results, _current_scan_state, findings_manager)

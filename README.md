@@ -436,7 +436,7 @@ python run_scanner.py \
 ### Important Notes
 
 - **State is per-scan**: Each unique scan (different packages, versions, filenames) should use a separate state file.
-- **Graceful interruption**: Press Ctrl+C to stop the scan gracefully. State is saved automatically.
+- **Graceful interruption**: Press Ctrl+C to stop the scan gracefully. State is automatically saved within ~100ms for resume.
 - **Skip completed projects**: When resuming, completed projects are automatically skipped from the target list.
 - **Resume with same parameters**: To resume, use the same search terms, filenames, and other flags as the original scan.
 

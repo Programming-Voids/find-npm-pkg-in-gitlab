@@ -60,31 +60,48 @@ def extract_matched_text(content: str, package_name: str, version: str, file_typ
     Attempts to find and return the relevant line(s) that contain the match.
     For structured files, returns a JSON/YAML/TOML snippet.
     For text files, returns the matching line(s).
+    Uses word boundary checking to avoid false positive text extraction.
     
     Args:
         content: File content
         package_name: Package name to search for
-        version: Version to search for
+        version: Version to search for (may be "unknown" for generic files)
         file_type: Type of file (generic, package-lock.json, etc.)
     
     Returns:
         Matched text snippet or None if not found
     """
+    import re
     lines = content.split('\n')
     
-    # For each line, check if it contains both package and version
-    for i, line in enumerate(lines):
-        if package_name in line:
-            # Check if version is also in this line or nearby lines
-            context_start = max(0, i - 1)
-            context_end = min(len(lines), i + 2)
-            context = '\n'.join(lines[context_start:context_end])
-            
-            if version in context or version.lstrip('=<>!~^') in context:
-                # Return the matched line with some context
-                return line.strip()
+    # For generic files with version="unknown", just find the package name
+    if version == "unknown":
+        for line in lines:
+            if package_name in line:
+                return line.strip()[:200]  # Limit to 200 chars
+        return None
     
-    # If not found, try to find just the package name
+    # For files with a specific version, look for lines with both package and version (with boundaries)
+    version_pattern = r'(?<![a-zA-Z0-9])' + re.escape(version) + r'(?![a-zA-Z0-9])'
+    
+    for i, line in enumerate(lines):
+        # Line must contain the package name
+        if package_name not in line:
+            continue
+        
+        # Check if version (with boundaries) is in this line
+        if re.search(version_pattern, line):
+            return line.strip()[:200]  # Limit to 200 chars
+        
+        # If not in this line, check nearby context (for multiline entries)
+        context_start = max(0, i - 1)
+        context_end = min(len(lines), i + 2)
+        context = '\n'.join(lines[context_start:context_end])
+        
+        if re.search(version_pattern, context):
+            return line.strip()[:200]
+    
+    # If version-specific match not found, fallback to non-version match (generic search case)
     for line in lines:
         if package_name in line:
             return line.strip()[:200]  # Limit to 200 chars
@@ -1082,19 +1099,110 @@ def scan_structured_lock_file(
 # GENERIC TEXT FILE PARSING
 # ============================================================================
 
+def _find_package_version_together(content: str, package_name: str, rule: "MatchRule") -> List[str]:
+    """Check if a package and version appear together in the content.
+    
+    For generic files, ensures package and version are associated, preventing
+    false positives where they exist separately for different dependencies.
+    
+    Strategy:
+    - Primary: Check if package and version appear on SAME LINE
+      (this handles: "axios 1.14.1", "axios@1.14.1", "axios=1.14.1", etc.)
+    - Secondary: For structured formats, if package on line N and next line N+1  
+      is indented and contains version info, consider that a match
+      (this handles multiline YAML-style entries like "axios:\n  version: 1.14.1")
+    
+    Conservative approach: don't match if version just happens to be nearby,
+    only match if version is clearly associated with the package.
+    
+    Args:
+        content: File content
+        package_name: Package name to find
+        rule: MatchRule with exact_versions and version_ranges
+        
+    Returns:
+        List of matched_rules if package+version found together, empty list otherwise
+    """
+    import re
+    lines = content.split('\n')
+    matched_rules: List[str] = []
+    
+    # PRIMARY: Look for package and version on the SAME LINE
+    # This is the most reliable indicator they go together
+    for line in lines:
+        if package_name not in line:
+            continue
+        
+        # Check each target version on this line
+        for version in rule.exact_versions:
+            pattern = r'(?<![a-zA-Z0-9])' + re.escape(version) + r'(?![a-zA-Z0-9])'
+            if re.search(pattern, line):
+                matched_rules.append(f"text-version:{version}")
+        
+        for version_range in rule.version_ranges:
+            pattern = r'(?<![a-zA-Z0-9])' + re.escape(version_range) + r'(?![a-zA-Z0-9])'
+            if re.search(pattern, line):
+                matched_rules.append(f"text-range:{version_range}")
+        
+        # If found on same line, return immediately
+        if matched_rules:
+            return matched_rules
+    
+    # SECONDARY: For structured multiline entries (e.g., YAML)
+    # Only check next line if it's indented (indicating continuation of previous entry)
+    for i, line in enumerate(lines):
+        if package_name not in line or i + 1 >= len(lines):
+            continue
+        
+        next_line = lines[i + 1]
+        # Only consider indented lines as continuations (YAML/structured format)
+        # Don't consider non-indented lines - they're new entries/packages
+        if not next_line.startswith((' ', '\t')):
+            # Next line is not indented, so it's a new entry, not a continuation
+            continue
+        
+        # Line is indented - check if version appears here
+        for version in rule.exact_versions:
+            pattern = r'(?<![a-zA-Z0-9])' + re.escape(version) + r'(?![a-zA-Z0-9])'
+            if re.search(pattern, next_line):
+                matched_rules.append(f"text-version:{version}")
+        
+        for version_range in rule.version_ranges:
+            pattern = r'(?<![a-zA-Z0-9])' + re.escape(version_range) + r'(?![a-zA-Z0-9])'
+            if re.search(pattern, next_line):
+                matched_rules.append(f"text-range:{version_range}")
+        
+        if matched_rules:
+            return matched_rules
+    
+    # Package found but version not associated
+    return []
+
+
 def _check_version_matches_in_text(content: str, rule: "MatchRule") -> List[str]:
-    """Check if any specified versions or ranges appear in the content as literal text."""
+    """Check if any specified versions or ranges appear in the content as literal text.
+    
+    Uses word boundary checking to prevent false positives like matching "1.4.1" when
+    searching for "1.14.1" (substring collision).
+    """
+    import re
     matched_rules: List[str] = []
 
-    # For generic files, we do simple substring matching for versions
-    # This is less sophisticated than semantic version matching but works for any file type
+    # For generic files, we do substring matching with word boundaries for versions
+    # This prevents false positives while still being flexible for various formats
     for version in rule.exact_versions:
-        if version in content:
+        # Create a regex pattern that matches the version as a complete token
+        # Word boundaries: must be preceded and followed by non-alphanumeric chars
+        # Examples of valid contexts: " 1.14.1", "@1.14.1", "=1.14.1", ":1.14.1", "1.14.1\n"
+        pattern = r'(?<![a-zA-Z0-9])' + re.escape(version) + r'(?![a-zA-Z0-9])'
+        if re.search(pattern, content):
             matched_rules.append(f"text-version:{version}")
 
     # Version ranges are also matched as literal strings in generic files
+    # Use same boundary checking for consistency
     for version_range in rule.version_ranges:
-        if version_range in content:
+        pattern = r'(?<![a-zA-Z0-9])' + re.escape(version_range) + r'(?![a-zA-Z0-9])'
+        if re.search(pattern, content):
             matched_rules.append(f"text-range:{version_range}")
 
     return matched_rules
@@ -1105,9 +1213,12 @@ def scan_generic_file(content: str, rule: "MatchRule") -> List[Dict[str, Any]]:
     Generic text-based search for any search terms in any file.
 
     Behavior:
-    - If versions/ranges are supplied, try to require both the term and at least one version/range text.
-    - For version ranges in generic files, we do a literal text match on the range string.
-    - If no versions/ranges are supplied, any term match is reported.
+    - If versions/ranges are supplied, require BOTH the package and version to appear together (same line or nearby context)
+    - For version ranges in generic files, we do a literal text match on the range string
+    - If no versions/ranges are supplied, any package match is reported
+    
+    This prevents false positives by ensuring package and version are actually associated,
+    not just existing separately somewhere in the file.
     """
     hits: List[Dict[str, Any]] = []
 
@@ -1116,20 +1227,19 @@ def scan_generic_file(content: str, rule: "MatchRule") -> List[Dict[str, Any]]:
         if package not in content:
             continue
 
-        # Check if any specified versions appear in the text
-        matched_rules = _check_version_matches_in_text(content, rule)
-
         # Determine if we have a valid match based on version requirements
         if rule.exact_versions or rule.version_ranges:
-            # Versions/ranges specified - require at least one version match
+            # Versions/ranges specified - require package AND version to appear together
             # This ensures we don't report false positives when specific versions are requested
+            matched_rules = _find_package_version_together(content, package, rule)
             if not matched_rules:
+                # Package found but not with the required version in its context
                 continue
             # else: we have matched_rules, so proceed with the hit
         else:
             # No versions specified, so any package match is valid
             # This allows broad searches when you just want to find packages regardless of version
-            matched_rules.append("text")
+            matched_rules = ["text"]
 
         # Record the finding
         hits.append(

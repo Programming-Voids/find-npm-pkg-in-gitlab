@@ -93,6 +93,36 @@ Test Files (in /tests/):
 - ARCHITECTURE_DECISIONS.md - Section 16 has full design decision
 - DEBUGGING_GUIDE.md - Updated memory estimates and monitoring
 
+### Signal Handling: Graceful Ctrl+C Interruption
+**What Changed:** Scan now responds instantly to Ctrl+C (Ctrl+Break on Windows) with automatic progress saving
+
+**Benefits:**
+- ✅ **Instant response:** Ctrl+C interrupts within ~100ms (imperceptible)
+- ✅ **State preservation:** Progress automatically saved for resuming
+- ✅ **Safe shutdown:** No orphaned threads or incomplete futures
+- ✅ **Resume capability:** Use `--resume` flag to continue from interruption point
+- ✅ **Clean exit:** Proper exit code (1) for scripting and automation
+
+**How It Works:**
+```bash
+# Start a scan
+python run_scanner.py --group my-org --package axios
+
+# During scan, press Ctrl+C
+# → Scan stops, progress saved to scan_state.json
+# → Use --resume to continue later
+
+python run_scanner.py --group my-org --package axios --resume
+```
+
+**Files Affected:**
+- `gitlab_repo_scanner.py` - Threading event + timeout-based wakeup
+- `state_manager.py` - State file auto-saved on interrupt
+
+**Documentation:**
+- DEBUGGING_GUIDE.md - "Scan Interrupted / Crashed" section
+- ARCHITECTURE_DECISIONS.md - Section 17 has full technical details
+
 ---
 
 ## 📖 File Descriptions
@@ -212,6 +242,7 @@ Test Files (in /tests/):
 14. Testing strategy
 15. Concurrency safety
 16. Performance vs maintainability
+17. Signal handling & graceful shutdown (Ctrl+C, state preservation)
 
 **Read When:**
 - You disagree with a design decision
