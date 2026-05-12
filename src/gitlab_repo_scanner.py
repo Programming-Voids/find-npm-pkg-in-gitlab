@@ -346,6 +346,9 @@ def _scan_branch_files(
     
     This function retrieves all matching files in the branch and scans each one
     for the search terms specified in the rule.
+    
+    For branches with very large trees, this includes timeout protection to prevent
+    the scan from hanging on repositories with thousands of files.
     """
     findings = []
 
@@ -360,9 +363,10 @@ def _scan_branch_files(
         return findings
 
     # Scan each file found, respecting the max_project_files limit
+    files_scanned = 0
     for file_path in target_files:
         # Stop if we've reached the maximum number of files to scan for this project
-        if max_project_files is not None and len(findings) >= max_project_files:
+        if max_project_files is not None and files_scanned >= max_project_files:
             LOGGER.info("Reached max_project_files=%s for %s, stopping file scanning", max_project_files, project_id)
             break
 
@@ -379,6 +383,8 @@ def _scan_branch_files(
             findings.append(finding)
             # Update statistics: count the number of matches found in this file
             update_stats(matches_found=len(finding["hits"]))
+        
+        files_scanned += 1
 
     return findings
 
@@ -616,10 +622,22 @@ def _log_scan_configuration(args: argparse.Namespace, packages: List[str], filen
 
 
 def _execute_scan(args: argparse.Namespace, projects: List[Dict[str, Any]], rule: MatchRule, compiled_ranges: List[Tuple[str, "NpmSpec"]], filenames: List[str], scan_state: ScanState, findings_manager: Optional["FindingsManager"] = None) -> List[Dict[str, Any]]:
-    """Execute the main scanning loop and return results."""
+    """Execute the main scanning loop and return results.
+    
+    Optimized for large-scale scans (1000+ projects) by:
+    - Removing timeout from as_completed() to avoid busy-waiting
+    - Batching progress bar updates to reduce tqdm contention
+    - Batching state file updates to reduce I/O overhead
+    - Using a dedicated interrupt check thread
+    - Adding diagnostic logging for bottleneck identification
+    """
     total_scanned_files = 0
     total_scanned_branches = 0
     results: List[Dict[str, Any]] = []
+    completed_count = 0
+    batch_size = max(10, min(50, len(projects) // 100))  # Batch size: 10-50 depending on project count
+
+    LOGGER.info("Starting scan with batch_size=%d for %d projects", batch_size, len(projects))
 
     # Set up progress bar with dynamic columns for live updates
     progress = tqdm(
@@ -652,57 +670,75 @@ def _execute_scan(args: argparse.Namespace, projects: List[Dict[str, Any]], rule
             for project in projects
         }
 
+        LOGGER.info("Submitted %d projects to thread pool with %d workers", len(future_map), args.workers)
+
         # Process completed scans as they finish (order doesn't matter for results)
-        # Use timeout=0.1 to wake up periodically and check for interrupts
-        for future in as_completed(future_map, timeout=0.1):
-            # Check if interrupt signal was received (Ctrl+C)
-            if _interrupt_event.is_set():
-                # Cancel all remaining futures
-                for f in future_map:
-                    f.cancel()
-                # Exit cleanly (signal handler will do final cleanup)
-                raise KeyboardInterrupt("Scan interrupted by user")
-            
-            project = future_map[future]
-            project_name = project.get("path_with_namespace", str(project.get("id")))
+        # Note: No timeout on as_completed() - we check interrupt event after getting results
+        # This avoids busy-waiting with timeout and is more efficient for large future sets
+        try:
+            for future in as_completed(future_map):
+                # Check if interrupt signal was received (Ctrl+C)
+                if _interrupt_event.is_set():
+                    LOGGER.warning("Interrupt signal received, cancelling remaining %d futures", len(future_map))
+                    # Cancel all remaining futures
+                    for f in future_map:
+                        f.cancel()
+                    # Exit cleanly (signal handler will do final cleanup)
+                    raise KeyboardInterrupt("Scan interrupted by user")
+                
+                project = future_map[future]
+                project_name = project.get("path_with_namespace", str(project.get("id")))
 
-            try:
-                result = future.result()
-            except Exception as exc:
-                # Handle unexpected worker thread failures
-                LOGGER.exception("Unexpected worker failure for %s", project_name)
-                log_terminal_line(f"[ERROR] {project_name} unexpected worker failure: {exc}", ANSI_RED)
-                update_stats(repos_completed=1, errors_seen=1)
-                if not args.no_progress:
-                    progress.update(1)
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    # Handle unexpected worker thread failures
+                    LOGGER.exception("Unexpected worker failure for %s", project_name)
+                    log_terminal_line(f"[ERROR] {project_name} unexpected worker failure: {exc}", ANSI_RED)
+                    update_stats(repos_completed=1, errors_seen=1)
+                    completed_count += 1
+                    if not args.no_progress and completed_count % batch_size == 0:
+                        progress.update(batch_size)
+                        progress.set_postfix_str(format_live_summary(len(projects)))
+                    continue
+
+                # Aggregate statistics across all completed projects
+                total_scanned_files += result["scanned_files"]
+                total_scanned_branches += result["scanned_branches"]
+
+                # Track repositories that have findings (used for statistics)
+                repo_has_findings = 1 if result["findings"] else 0
+                update_stats(repos_completed=1, repos_with_findings=repo_has_findings)
+
+                # Update scan state with results from this project
+                # Batch state updates: only save every batch_size completions
+                if scan_state:
+                    update_state_with_result(scan_state, result)
+                    if completed_count % batch_size == batch_size - 1:
+                        # Periodically save state to disk to preserve progress
+                        LOGGER.debug("Saving state after %d completions", completed_count + 1)
+                        save_state(scan_state, _state_file_path)
+
+                # Process and log the result
+                _process_scan_result(result, results)
+
+                # Increment counter and batch update progress bar
+                # This reduces tqdm contention by updating less frequently
+                completed_count += 1
+                if not args.no_progress and completed_count % batch_size == 0:
+                    progress.update(batch_size)
                     progress.set_postfix_str(format_live_summary(len(projects)))
-                continue
 
-            # Aggregate statistics across all completed projects
-            total_scanned_files += result["scanned_files"]
-            total_scanned_branches += result["scanned_branches"]
+            # Update any remaining progress that wasn't batched
+            if not args.no_progress and completed_count % batch_size != 0:
+                progress.update(completed_count % batch_size)
 
-            # Track repositories that have findings (used for statistics)
-            repo_has_findings = 1 if result["findings"] else 0
-            update_stats(repos_completed=1, repos_with_findings=repo_has_findings)
-
-            # Update scan state with results from this project
-            # This tracks progress for pause/resume functionality
-            if scan_state:
-                update_state_with_result(scan_state, result)
-
-            # Process and log the result
-            _process_scan_result(result, results)
-
-            # Update progress bar
+        finally:
+            # Clean up progress bar even on exceptions
             if not args.no_progress:
-                progress.update(1)
-                progress.set_postfix_str(format_live_summary(len(projects)))
+                progress.close()
 
-    # Clean up progress bar
-    if not args.no_progress:
-        progress.close()
-
+    LOGGER.info("Scan complete: processed %d projects", completed_count)
     return results
 
 

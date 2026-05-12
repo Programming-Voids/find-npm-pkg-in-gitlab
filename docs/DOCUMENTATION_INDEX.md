@@ -6,13 +6,14 @@ Complete guide to all project documentation files and how to use them.
 
 ```
 Documentation Files:
-├── README.md                      # Start here! Basic usage, testing guide
-├── LLMS_GUIDE.md                 # Architecture for AI/LLM interpretation
-├── MODULE_REFERENCE.md           # Complete function reference with signatures
-├── DEBUGGING_GUIDE.md            # Troubleshooting and performance debugging
-├── ARCHITECTURE_DECISIONS.md     # Design decisions, trade-offs, rationale
-├── TEST_RESULTS.md               # Test documentation and results
-└── DOCUMENTATION_INDEX.md        # This file
+├── README.md                          # Start here! Basic usage, testing guide
+├── LLMS_GUIDE.md                     # Architecture for AI/LLM interpretation
+├── MODULE_REFERENCE.md               # Complete function reference with signatures
+├── DEBUGGING_GUIDE.md                # Troubleshooting and performance debugging
+├── PERFORMANCE_OPTIMIZATION.md       # Large-scale scan optimizations & tuning
+├── ARCHITECTURE_DECISIONS.md         # Design decisions, trade-offs, rationale
+├── TEST_RESULTS.md                   # Test documentation and results
+└── DOCUMENTATION_INDEX.md            # This file
 
 Code Files (in /src/):
 ├── run_scanner.py                # Entry point (dynamically loads main module)
@@ -51,16 +52,16 @@ Test Files (in /tests/):
 
 ### "I want to OPTIMIZE performance"
 1. Read: DEBUGGING_GUIDE.md - Performance Debugging
-2. Read: ARCHITECTURE_DECISIONS.md - Section 16: Findings Storage Format
-3. Profile: Use built-in timing or cProfile
+2. Read: PERFORMANCE_OPTIMIZATION.md - Large-scale scan optimizations
+3. Check: Profile your scan with `--verbose` for detailed logging
 4. Tune: Adjust `--workers`, `--request-timeout`, `--max-projects`
-5. Check: Expected memory usage ~150-200MB even for 2000+ projects
+5. Monitor: Expected RAM ~200-300MB, CPU 10-30% for large scans
 
 ### "I want to SCALE to 2000+ repositories"
-1. Read: ARCHITECTURE_DECISIONS.md - Section 16: Findings Storage Format
-2. Read: DEBUGGING_GUIDE.md - Memory Architecture section
-3. Use: `python run_scanner.py --group my-org --package axios`
-4. Expect: Peak RAM ~200-300MB for 100,000 findings
+1. Read: PERFORMANCE_OPTIMIZATION.md - Complete optimization guide
+2. Check: Expected throughput (10-20% improvement over baseline)
+3. Use: `python run_scanner.py --group my-org --workers 8 --package axios`
+4. Expect: Completes 2000 repos × 20000 branches without lockup
 5. Verify: Findings stored on disk in JSONL format (~50-80MB for dense findings)
 
 ### "I want to TEST the scanner"

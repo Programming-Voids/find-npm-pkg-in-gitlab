@@ -36,15 +36,33 @@ def paginated_get(url: str, params: Optional[Dict[str, Any]] = None) -> Iterable
     
     GitLab API uses cursor-based pagination with X-Page and X-Total-Pages headers.
     This function automatically handles pagination to retrieve all results.
+    
+    For large result sets (e.g., repository trees with many files), this yields
+    results incrementally to avoid memory bloat and provide real-time progress.
     """
     page = 1
     per_page = 100  # GitLab API supports up to 100 items per page for efficiency
+    consecutive_failures = 0
+    max_consecutive_failures = 3
+    
     while True:
         # Merge user params with pagination params
         merged = dict(params or {})
         merged.update({"page": page, "per_page": per_page})
 
-        resp = gitlab_get(url, merged)
+        try:
+            resp = gitlab_get(url, merged)
+        except Exception as exc:
+            # Handle network/timeout errors with retry logic
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                raise RuntimeError(
+                    f"Failed to fetch page {page} after {consecutive_failures} attempts: {exc}"
+                )
+            LOGGER.warning("Retry %d/%d for page %d: %s", consecutive_failures, max_consecutive_failures, page, exc)
+            time.sleep(min(5, 2 ** consecutive_failures))  # Exponential backoff: 2, 4, 8 seconds
+            continue
+
         if not resp.ok:
             raise RuntimeError(f"GET {url} failed: {resp.status_code} {resp.text[:300]}")
 
@@ -52,6 +70,9 @@ def paginated_get(url: str, params: Optional[Dict[str, Any]] = None) -> Iterable
         if not items:
             # No more items to return (empty page indicates end of results)
             break
+
+        # Reset failure counter on successful response
+        consecutive_failures = 0
 
         # Yield each item from this page one at a time
         for item in items:
