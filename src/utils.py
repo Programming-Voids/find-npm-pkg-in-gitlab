@@ -5,9 +5,9 @@ Utility functions, data classes, and logging setup for the GitLab package scanne
 import logging
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -30,6 +30,9 @@ class MatchRule:
     packages: List[str]
     exact_versions: List[str]
     version_ranges: List[str]
+    # Package-version pairs: (package_name, [exact_versions], [version_ranges])
+    # When populated, enables matching specific versions per package
+    package_version_pairs: List[Tuple[str, List[str], List[str]]] = field(default_factory=list)
 
 
 @dataclass

@@ -54,6 +54,51 @@ The scanner provides **structured parsing** for the following package lock file 
 ### Dart
 - `pubspec.lock` (Pub) — YAML format
 
+## Search with Package-Version Pairs
+
+The scanner now supports **distinct version numbers per package** using `--package-version`.
+
+This allows you to search for multiple packages each with their own specific version or range:
+
+```bash
+# Exact versions per package
+python run_scanner.py \
+  --package-version axios@1.14.0 \
+  --package-version lodash@4.17.21 \
+  --package-version express@4.18.2
+```
+
+```bash
+# Version ranges per package
+python run_scanner.py \
+  --package-version axios@">=1.14.0 <2.0.0" \
+  --package-version lodash@"^4.17.0"
+```
+
+```bash
+# Mixed exact and range versions
+python run_scanner.py \
+  --package-version axios@1.14.0 \
+  --package-version lodash@">=4.17.0" \
+  --package-version typescript@5.0.0
+```
+
+### Key Differences
+
+**`--package-version` (paired mode)**: Search for specific package+version combinations
+```bash
+# Finds ONLY axios 1.14.0 (not 1.14.1, not 1.15.0)
+python run_scanner.py --package-version axios@1.14.0
+```
+
+**`--package + --version` (cross-product mode)**: Search for any package with any version
+```bash
+# Finds: axios 1.14.0, axios 1.14.1, requests 1.14.0, requests 1.14.1
+python run_scanner.py \
+  --package axios --package requests \
+  --version 1.14.0 --version 1.14.1
+```
+
 ## What changed
 
 The scanner can now search **any filename** using one or more `--filename` flags.

@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
         "--package",
         action="append",
         dest="packages",
-        required=True,
+        required=False,
         help="Search term or package name to look for. Repeatable. Example: --package axios --package plain-crypto-js",
     )
 
@@ -106,6 +106,14 @@ def parse_args() -> argparse.Namespace:
         dest="ranges",
         default=[],
         help='npm semver range to match. Repeatable. Example: --range ">=1.14.0 <1.14.2"',
+    )
+
+    parser.add_argument(
+        "--package-version",
+        action="append",
+        dest="package_versions",
+        default=[],
+        help='Package name with specific version or range. Format: name@version or name@range. Repeatable. Example: --package-version axios@1.14.0 --package-version lodash@">=4.17.0"',
     )
 
     parser.add_argument(
@@ -492,14 +500,56 @@ def _validate_environment_variables() -> None:
         fail("GITLAB_TOKEN is required")
 
 
-def _validate_required_arguments(packages: List[str], filenames: List[str], workers: int) -> None:
+def _validate_required_arguments(packages: List[str], package_versions: List[Tuple[str, List[str], List[str]]], filenames: List[str], workers: int) -> None:
     """Validate required command-line arguments."""
-    if not packages:
-        fail("At least one --package is required")
+    if not packages and not package_versions:
+        fail("At least one --package or --package-version is required")
     if not filenames:
         fail("At least one --filename is required")
     if workers < 1:
         fail("--workers must be >= 1")
+
+
+def _parse_package_versions(package_version_specs: List[str]) -> List[Tuple[str, List[str], List[str]]]:
+    """Parse --package-version specs into (package_name, [exact_versions], [version_ranges]) tuples.
+    
+    Format examples:
+    - "axios@1.14.0" -> ("axios", ["1.14.0"], [])
+    - "lodash@>=4.17.0" -> ("lodash", [], [">=4.17.0"])
+    - "requests@2.0.0 OR 2.1.0" -> Not supported, use separate flags
+    
+    Args:
+        package_version_specs: List of "name@version_or_range" strings
+    
+    Returns:
+        List of (package_name, exact_versions, version_ranges) tuples
+    """
+    pairs: List[Tuple[str, List[str], List[str]]] = []
+    
+    for spec in package_version_specs:
+        if '@' not in spec:
+            fail(f"Invalid --package-version format: '{spec}'. Expected format: name@version (e.g., axios@1.14.0)")
+        
+        parts = spec.split('@', 1)  # Split on first @ only to allow @ in version specs
+        package_name = parts[0].strip()
+        version_spec = parts[1].strip()
+        
+        if not package_name:
+            fail(f"Invalid --package-version: package name cannot be empty in '{spec}'")
+        if not version_spec:
+            fail(f"Invalid --package-version: version cannot be empty in '{spec}'")
+        
+        # Determine if it's an exact version or a range
+        # Ranges typically contain operators like >=, <=, ~, ^, etc.
+        # Exact versions are plain dotted numbers like 1.2.3
+        if any(op in version_spec for op in ['>=', '<=', '>', '<', '~', '^', '||', 'x', 'X', '*', '-']):
+            # It's a range
+            pairs.append((package_name, [], [version_spec]))
+        else:
+            # It's an exact version
+            pairs.append((package_name, [version_spec], []))
+    
+    return pairs
 
 
 def _validate_and_setup_args(args: argparse.Namespace) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[str], List[Tuple[str, "NpmSpec"]], MatchRule]:
@@ -513,17 +563,24 @@ def _validate_and_setup_args(args: argparse.Namespace) -> Tuple[List[str], List[
     _validate_environment_variables()
 
     # Normalize argument lists
-    packages = normalize_list(args.packages)
+    packages = normalize_list(args.packages) if args.packages else []
     versions = normalize_list(args.versions) if args.versions else []
     ranges = normalize_list(args.ranges) if args.ranges else []
+    package_version_specs = normalize_list(args.package_versions) if args.package_versions else []
+    
     # Handle filenames default: use package-lock.json if none specified
     filenames = normalize_list(args.filenames) if args.filenames else ["package-lock.json"]
     groups = normalize_list(args.groups) if args.groups else []
     project_filters = normalize_list(args.project_filters) if args.project_filters else []
     branch_patterns = normalize_list(args.branch_patterns) if args.branch_patterns else []
 
+    # Parse package-version pairs
+    package_version_pairs: List[Tuple[str, List[str], List[str]]] = []
+    if package_version_specs:
+        package_version_pairs = _parse_package_versions(package_version_specs)
+    
     # Validate required arguments
-    _validate_required_arguments(packages, filenames, args.workers)
+    _validate_required_arguments(packages, package_version_pairs, filenames, args.workers)
 
     # Warn about conflicting branch options
     if args.all_branches and branch_patterns:
@@ -532,7 +589,12 @@ def _validate_and_setup_args(args: argparse.Namespace) -> Tuple[List[str], List[
 
     # Build version matching rules
     compiled_ranges = build_specs(ranges)
-    rule = MatchRule(packages=packages, exact_versions=versions, version_ranges=ranges)
+    rule = MatchRule(
+        packages=packages,
+        exact_versions=versions,
+        version_ranges=ranges,
+        package_version_pairs=package_version_pairs
+    )
 
     return packages, versions, ranges, filenames, groups, project_filters, branch_patterns, compiled_ranges, rule
 

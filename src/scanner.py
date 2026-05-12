@@ -13,6 +13,7 @@ The architecture is extensible to add new lock file formats:
 """
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
 from semantic_version import NpmSpec, Version
@@ -139,6 +140,41 @@ def version_matches(
     return (len(matched_rules) > 0), matched_rules
 
 
+def _compile_package_version_ranges(package_version_pairs: List[Tuple[str, List[str], List[str]]]) -> List[Tuple[str, List[str], List[Tuple[str, NpmSpec]]]]:
+    """Compile version ranges for package-version pairs.
+    
+    Returns list of (package_name, exact_versions, compiled_ranges) tuples.
+    """
+    compiled_pairs: List[Tuple[str, List[str], List[Tuple[str, NpmSpec]]]] = []
+    
+    for package_name, exact_versions, version_ranges in package_version_pairs:
+        compiled_ranges = build_specs(version_ranges)
+        compiled_pairs.append((package_name, exact_versions, compiled_ranges))
+    
+    return compiled_pairs
+
+
+def _package_version_pair_matches(
+    package_name: str,
+    installed_version: str,
+    compiled_pairs: List[Tuple[str, List[str], List[Tuple[str, NpmSpec]]]],
+) -> Tuple[bool, List[str]]:
+    """Check if a (package, version) matches any of the package-version pairs.
+    
+    Returns (matched, matched_rules).
+    """
+    matched_rules: List[str] = []
+    
+    for pair_pkg_name, exact_versions, compiled_ranges in compiled_pairs:
+        if pair_pkg_name == package_name:
+            # This package is in a pair, check if version matches
+            matched, rules = version_matches(installed_version, exact_versions, compiled_ranges)
+            if matched:
+                matched_rules.extend(rules)
+    
+    return (len(matched_rules) > 0), matched_rules
+
+
 def package_path_matches(pkg_path: str, package_name: str) -> bool:
     """Check if a package path corresponds to the given package name in node_modules."""
     suffix = f"node_modules/{package_name}"
@@ -154,6 +190,10 @@ def find_in_packages_map(
     
     The 'packages' map is the modern npm lock file format that lists all installed
     packages flat with their paths (e.g., "node_modules/axios").
+    
+    Supports two matching modes:
+    1. Package-version pairs (--package-version): Match specific package+version combinations
+    2. Cross-product (--package + --version/--range): Match any package against any version
     """
     hits: List[Dict[str, Any]] = []
     packages = lock_data.get("packages")
@@ -162,6 +202,9 @@ def find_in_packages_map(
     if not isinstance(packages, dict):
         return hits
 
+    # Compile package-version pairs for efficient matching
+    compiled_pairs = _compile_package_version_ranges(rule.package_version_pairs) if rule.package_version_pairs else []
+    
     # Iterate through each package entry in the packages map
     for pkg_path, meta in packages.items():
         # Skip invalid entries (entries must have string paths and dict metadata)
@@ -174,27 +217,50 @@ def find_in_packages_map(
         if not isinstance(installed_version, str):
             continue
 
-        # Check each search term against this package
-        for package_name in rule.packages:
-            # Check if the package path belongs to this package name
-            if package_path_matches(pkg_path, package_name):
-                # Test if version matches any of the specified criteria
-                matched, matched_rules = version_matches(
-                    installed_version,
-                    rule.exact_versions,
-                    compiled_ranges,
-                )
-                # If version matches, record the hit
-                if matched:
-                    hits.append(
-                        {
-                            "package": package_name,
-                            "version": installed_version,
-                            "location": pkg_path,
-                            "matched_rules": matched_rules,
-                            "source": "package-lock.json",
-                        }
+        # Determine which matching mode to use
+        if compiled_pairs:
+            # Mode 1: Package-version pairs (exact matching of package+version combinations)
+            for package_name in rule.packages + [p[0] for p in rule.package_version_pairs]:
+                if package_path_matches(pkg_path, package_name):
+                    # Check if this package+version pair matches any of the specified pairs
+                    matched, matched_rules = _package_version_pair_matches(
+                        package_name,
+                        installed_version,
+                        compiled_pairs,
                     )
+                    # Only record if there are pairs defined for this package
+                    if matched:
+                        hits.append(
+                            {
+                                "package": package_name,
+                                "version": installed_version,
+                                "location": pkg_path,
+                                "matched_rules": matched_rules,
+                                "source": "package-lock.json",
+                            }
+                        )
+        else:
+            # Mode 2: Cross-product (match any package against any version)
+            for package_name in rule.packages:
+                # Check if the package path belongs to this package name
+                if package_path_matches(pkg_path, package_name):
+                    # Test if version matches any of the specified criteria
+                    matched, matched_rules = version_matches(
+                        installed_version,
+                        rule.exact_versions,
+                        compiled_ranges,
+                    )
+                    # If version matches, record the hit
+                    if matched:
+                        hits.append(
+                            {
+                                "package": package_name,
+                                "version": installed_version,
+                                "location": pkg_path,
+                                "matched_rules": matched_rules,
+                                "source": "package-lock.json",
+                            }
+                        )
 
     return hits
 
@@ -205,17 +271,18 @@ def _process_dependency_node(
     current_path: str,
     rule: "MatchRule",
     compiled_ranges: List[Tuple[str, NpmSpec]],
+    compiled_pairs: List[Tuple[str, List[str], List[Tuple[str, NpmSpec]]]],
 ) -> List[Dict[str, Any]]:
     """Process a single dependency node and return any matches found."""
     hits: List[Dict[str, Any]] = []
 
     installed_version = meta.get("version")
-    if dep_name in rule.packages and isinstance(installed_version, str):
-        matched, matched_rules = version_matches(
-            installed_version,
-            rule.exact_versions,
-            compiled_ranges,
-        )
+    if not isinstance(installed_version, str):
+        return hits
+    
+    if compiled_pairs:
+        # Mode 1: Package-version pairs
+        matched, matched_rules = _package_version_pair_matches(dep_name, installed_version, compiled_pairs)
         if matched:
             hits.append(
                 {
@@ -226,6 +293,24 @@ def _process_dependency_node(
                     "source": "package-lock.json",
                 }
             )
+    else:
+        # Mode 2: Cross-product
+        if dep_name in rule.packages:
+            matched, matched_rules = version_matches(
+                installed_version,
+                rule.exact_versions,
+                compiled_ranges,
+            )
+            if matched:
+                hits.append(
+                    {
+                        "package": dep_name,
+                        "version": installed_version,
+                        "location": current_path,
+                        "matched_rules": matched_rules,
+                        "source": "package-lock.json",
+                    }
+                )
 
     return hits
 
@@ -235,8 +320,12 @@ def find_in_dependencies_tree(
     trail: str,
     rule: "MatchRule",
     compiled_ranges: List[Tuple[str, NpmSpec]],
+    compiled_pairs: List[Tuple[str, List[str], List[Tuple[str, NpmSpec]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Recursively search for matches in the dependencies tree of a package-lock.json file."""
+    if compiled_pairs is None:
+        compiled_pairs = []
+    
     hits: List[Dict[str, Any]] = []
 
     if not isinstance(node, dict):
@@ -251,10 +340,10 @@ def find_in_dependencies_tree(
 
         if isinstance(meta, dict):
             # Process this dependency node
-            hits.extend(_process_dependency_node(dep_name, meta, current_path, rule, compiled_ranges))
+            hits.extend(_process_dependency_node(dep_name, meta, current_path, rule, compiled_ranges, compiled_pairs))
 
             # Recursively process child dependencies
-            hits.extend(find_in_dependencies_tree(meta, current_path, rule, compiled_ranges))
+            hits.extend(find_in_dependencies_tree(meta, current_path, rule, compiled_ranges, compiled_pairs))
         else:
             # Skip non-dict metadata
             continue
@@ -300,7 +389,9 @@ def parse_package_lock_json(
 
     hits: List[Dict[str, Any]] = []
     hits.extend(find_in_packages_map(lock_data, rule, compiled_ranges))
-    hits.extend(find_in_dependencies_tree(lock_data, "", rule, compiled_ranges))
+    # Compile package-version pairs once for the tree search
+    compiled_pairs = _compile_package_version_ranges(rule.package_version_pairs) if rule.package_version_pairs else []
+    hits.extend(find_in_dependencies_tree(lock_data, "", rule, compiled_ranges, compiled_pairs))
     return dedupe_hits(hits)
 
 
@@ -1217,40 +1308,93 @@ def scan_generic_file(content: str, rule: "MatchRule") -> List[Dict[str, Any]]:
     - For version ranges in generic files, we do a literal text match on the range string
     - If no versions/ranges are supplied, any package match is reported
     
+    Supports two matching modes:
+    1. Package-version pairs (--package-version): Match specific package+version combinations
+    2. Cross-product (--package + --version/--range): Match any package against any version
+    
     This prevents false positives by ensuring package and version are actually associated,
     not just existing separately somewhere in the file.
     """
     hits: List[Dict[str, Any]] = []
 
-    for package in rule.packages:
-        # Skip packages that don't appear in the content at all
-        if package not in content:
-            continue
-
-        # Determine if we have a valid match based on version requirements
-        if rule.exact_versions or rule.version_ranges:
-            # Versions/ranges specified - require package AND version to appear together
-            # This ensures we don't report false positives when specific versions are requested
-            matched_rules = _find_package_version_together(content, package, rule)
-            if not matched_rules:
-                # Package found but not with the required version in its context
+    # Collect all packages to search for (from both --package and --package-version)
+    all_packages = list(rule.packages) + [p[0] for p in rule.package_version_pairs]
+    
+    # Handle package-version pairs mode
+    if rule.package_version_pairs:
+        for pair_pkg_name, pair_exact_versions, pair_version_ranges in rule.package_version_pairs:
+            # Skip packages that don't appear in the content at all
+            if pair_pkg_name not in content:
                 continue
-            # else: we have matched_rules, so proceed with the hit
-        else:
-            # No versions specified, so any package match is valid
-            # This allows broad searches when you just want to find packages regardless of version
-            matched_rules = ["text"]
+            
+            # Build a temporary rule with just this pair's versions
+            matched_rules: List[str] = []
+            
+            if pair_exact_versions or pair_version_ranges:
+                # Check for specific versions or ranges
+                for version in pair_exact_versions:
+                    pattern = r'(?<![a-zA-Z0-9])' + re.escape(version) + r'(?![a-zA-Z0-9])'
+                    if re.search(pattern, content):
+                        matched_rules.append(f"text-version:{version}")
+                
+                for version_range in pair_version_ranges:
+                    pattern = r'(?<![a-zA-Z0-9])' + re.escape(version_range) + r'(?![a-zA-Z0-9])'
+                    if re.search(pattern, content):
+                        matched_rules.append(f"text-range:{version_range}")
+                
+                # Only record if this pair's version was found
+                if matched_rules:
+                    hits.append(
+                        {
+                            "package": pair_pkg_name,
+                            "version": "unknown",
+                            "location": "text-match",
+                            "matched_rules": matched_rules,
+                            "source": "generic",
+                        }
+                    )
+            else:
+                # No specific versions for this pair, just check if package exists
+                hits.append(
+                    {
+                        "package": pair_pkg_name,
+                        "version": "unknown",
+                        "location": "text-match",
+                        "matched_rules": ["text"],
+                        "source": "generic",
+                    }
+                )
+    else:
+        # Cross-product mode: match any --package against any version
+        for package in rule.packages:
+            # Skip packages that don't appear in the content at all
+            if package not in content:
+                continue
 
-        # Record the finding
-        hits.append(
-            {
-                "package": package,
-                "version": "unknown",  # Generic files don't have structured version info
-                "location": "text-match",  # Generic location indicator
-                "matched_rules": matched_rules,
-                "source": "generic",  # Indicates this came from generic text search
-            }
-        )
+            # Determine if we have a valid match based on version requirements
+            if rule.exact_versions or rule.version_ranges:
+                # Versions/ranges specified - require package AND version to appear together
+                # This ensures we don't report false positives when specific versions are requested
+                matched_rules = _find_package_version_together(content, package, rule)
+                if not matched_rules:
+                    # Package found but not with the required version in its context
+                    continue
+                # else: we have matched_rules, so proceed with the hit
+            else:
+                # No versions specified, so any package match is valid
+                # This allows broad searches when you just want to find packages regardless of version
+                matched_rules = ["text"]
+
+            # Record the finding
+            hits.append(
+                {
+                    "package": package,
+                    "version": "unknown",  # Generic files don't have structured version info
+                    "location": "text-match",  # Generic location indicator
+                    "matched_rules": matched_rules,
+                    "source": "generic",  # Indicates this came from generic text search
+                }
+            )
 
     return dedupe_hits(hits)
 
