@@ -37,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from tqdm import tqdm
+from semantic_version import NpmSpec
 
 from . import config
 from .config import GITLAB_TOKEN, GITLAB_URL

@@ -14,11 +14,14 @@ The architecture is extensible to add new lock file formats:
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, TYPE_CHECKING
 
 from semantic_version import NpmSpec, Version
 
 from .utils import LOGGER
+
+if TYPE_CHECKING:
+    from .utils import MatchRule
 
 # Try importing PyYAML for yarn.lock support
 try:
